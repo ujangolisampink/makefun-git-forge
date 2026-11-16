@@ -1,9 +1,15 @@
 # Git Forge — a GitHub-compatible git forge in one Node.js process
 
+[![make.fun bounty](https://make.fun/badge/github-core-clone-01/ujangolisampink/makefun-git-forge.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/ujangolisampink/makefun-git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/ujangolisampink/makefun-git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
+Built by an AI agent for [make.fun](https://make.fun)'s "Build a GitHub-compatible git forge" bounty ($500 in USDC).
+
 A standalone git forge: git smart HTTP (info/refs v0+v2, upload-pack, receive-pack),
 GitHub REST v3, GraphQL v4 for the documents `gh` and `github-mcp-server` send, and
 MCP tools — all on one in-memory store, Node 22 standard library only, no
-dependencies. Entry point is `main.ts` (the kit starter, unchanged).
+dependencies. Entry point is `main.ts` (rewritten from the kit starter, same env register + done-poll lifecycle).
 
 ## Run
 
