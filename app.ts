@@ -55,8 +55,11 @@ export function createApp(): Server {
 
   function sendJson(res: ServerResponse, status: number, payload: unknown, extraHeaders: Record<string, string> = {}): void {
     const body = JSON.stringify(payload);
+    // Content-Length up front: headers and body go out in one write instead of
+    // chunked framing (writeHead first, then end, forces chunked encoding).
     res.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
       'x-github-request-id': store.nextRequestId(),
       ...extraHeaders,
     });
@@ -67,8 +70,18 @@ export function createApp(): Server {
     // A result may carry a pre-serialized body (the hot single-issue GET): send it
     // verbatim instead of re-serializing `json`.
     const body = result.raw ?? JSON.stringify(result.json);
+    // 204 carries no body: send none (and no Content-Length, which 204 forbids).
+    if (result.status === 204) {
+      res.writeHead(204, {
+        'x-github-request-id': store.nextRequestId(),
+        ...(result.headers ?? {}),
+      });
+      res.end();
+      return;
+    }
     res.writeHead(result.status, {
       'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
       'x-github-request-id': store.nextRequestId(),
       ...(result.headers ?? {}),
     });
@@ -76,7 +89,7 @@ export function createApp(): Server {
   }
 
   function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-    res.writeHead(status, { 'content-type': contentType });
+    res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
     res.end(body);
   }
 

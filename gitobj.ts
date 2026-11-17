@@ -311,36 +311,22 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
-function adler32(data: Buffer): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; i++) {
-    a = (a + (data[i] as number)) % 65521;
-    b = (b + a) % 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-
 /**
- * Inflate one pack object starting at `start`. inflateSync ignores trailing bytes, so
- * one inflate of the remainder yields the data; the stream end is found by scanning for
- * its Adler-32 checksum and verified by re-inflating the candidate slice. This avoids
- * exception-driven probing (throwing per guess dominated push before).
+ * Inflate one pack object starting at `start`. One inflateSync call with
+ * `info: true` returns the engine, whose `bytesWritten` is the number of input
+ * bytes the stream consumed (zlib header + deflate data + Adler-32 trailer),
+ * so the stream end is known without scanning for the checksum and without a
+ * second verification inflate: the data itself is exactly what inflateSync
+ * produced, and a wrong end would break the next object's parse (or, for the
+ * last object, is unused). This halves the inflate calls per pack object
+ * versus the previous scan-and-verify approach.
  */
 function inflateObject(buf: Buffer, start: number, limit: number, expectedSize: number): { end: number; data: Buffer } {
-  const data = inflateSync(buf.subarray(start, limit));
+  const { buffer: data, engine } = inflateSync(buf.subarray(start, limit), { info: true });
   if (data.length !== expectedSize) throw new Error('pack object size mismatch');
-  const adler = adler32(data);
-  for (let e = start + 2; e + 4 <= limit; e++) {
-    if (buf.readUInt32BE(e) !== adler) continue;
-    const end = e + 4;
-    try {
-      if (inflateSync(buf.subarray(start, end)).length === expectedSize) return { end, data };
-    } catch {
-      // Coincidental Adler-32 match inside deflate data: keep scanning.
-    }
-  }
-  throw new Error('zlib stream end not found in pack');
+  const end = start + (engine as { bytesWritten: number }).bytesWritten;
+  if (end > limit || end <= start) throw new Error('zlib stream end not found in pack');
+  return { end, data };
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {

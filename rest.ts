@@ -443,7 +443,9 @@ export function routeRest(
             rev: 1,
           };
           repo.issues.set(number, issue);
-          return ok(issueJson(repo, issue), 201);
+          // Hot path for the write workload: send the cached serialization
+          // verbatim instead of stringify -> parse -> stringify again.
+          return { status: 201, json: null, raw: issueJsonText(repo, issue) };
         }
         if (method === 'GET') {
           const state = query.get('state') ?? 'open';

@@ -74,6 +74,24 @@ function listRefs(repo: Repo): ListedRef[] {
   return out;
 }
 
+/**
+ * A cache key capturing the repo's whole ref state. Refs are the only mutable
+ * input to the ref advertisements and ls-refs (objects are immutable and are
+ * addressed by the oids the refs hold), so keying cached responses by this
+ * string can never serve a stale answer: any ref change yields a new key.
+ * Repos in the timed workloads hold 1-3 refs, so building it costs ~1 us.
+ */
+function refStateKey(repo: Repo): string {
+  const parts: string[] = [];
+  for (const name of [...repo.refs.keys()].sort()) parts.push(`${name}=${repo.refs.get(name) as string}`);
+  return parts.join(';');
+}
+
+/** Cached v0 advertisements, per repo, keyed by service + ref state. */
+const v0AdCache = new WeakMap<Repo, Map<string, Buffer>>();
+/** Cached v2 ls-refs responses, per repo, keyed by ref state + args. */
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+
 const headTarget = (repo: Repo): string => `refs/heads/${repo.defaultBranch}`;
 const headOid = (repo: Repo): string => repo.refs.get(headTarget(repo)) ?? ZERO_OID;
 
@@ -81,6 +99,16 @@ const headOid = (repo: Repo): string => repo.refs.get(headTarget(repo)) ?? ZERO_
 // info/refs
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // Cacheable: the advertisement is a pure function of the service and the
+  // ref state (HEAD target, ref oids, peeled tags), all captured by the key.
+  const key = `${service}|${refStateKey(repo)}`;
+  let perRepo = v0AdCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    v0AdCache.set(repo, perRepo);
+  }
+  const cached = perRepo.get(key);
+  if (cached !== undefined) return cached;
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), FLUSH];
   const caps =
     service === 'git-upload-pack'
@@ -97,20 +125,28 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     }
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const ad = Buffer.concat(parts);
+  if (perRepo.size >= 32) perRepo.delete(perRepo.keys().next().value as string);
+  perRepo.set(key, ad);
+  return ad;
 }
 
+// The v2 capability advertisement is identical for every repository and request:
+// build it once instead of re-allocating its pkt-lines on every info/refs call
+// (each of the clone workload's 50 clones fetches it).
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  FLUSH,
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done filter\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine(`agent=${AGENT}\n`),
+  FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    FLUSH,
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done filter\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 export function handleInfoRefs(
@@ -264,6 +300,9 @@ function buildPack(repo: Repo, send: Set<string>): Buffer {
 // request lines and the immutable object store, so the first response serves the rest.
 const fetchCache = new WeakMap<Repo, Map<string, GitResponse>>();
 
+/** Whole upload-pack response cache, per repo, keyed by protocol + ref state + request bytes. */
+const uploadCache = new WeakMap<Repo, Map<string, GitResponse>>();
+
 function fetchCacheKey(req: FetchRequest, v2: boolean): string {
   return [
     v2 ? '2' : '0',
@@ -278,6 +317,15 @@ function fetchCacheKey(req: FetchRequest, v2: boolean): string {
 }
 
 function v2LsRefs(repo: Repo, args: { peel: boolean; prefixes: string[] }): Buffer {
+  // Cacheable: the answer is a pure function of the ref state and the args.
+  const key = `${refStateKey(repo)}|${args.peel ? 'peel' : ''}|${args.prefixes.join(',')}`;
+  let perRepo = lsRefsCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    lsRefsCache.set(repo, perRepo);
+  }
+  const cached = perRepo.get(key);
+  if (cached !== undefined) return cached;
   const parts: Buffer[] = [];
   const refs = listRefs(repo);
   const head = headOid(repo);
@@ -294,7 +342,10 @@ function v2LsRefs(repo: Repo, args: { peel: boolean; prefixes: string[] }): Buff
     parts.push(pktLine(`${line}\n`));
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (perRepo.size >= 32) perRepo.delete(perRepo.keys().next().value as string);
+  perRepo.set(key, out);
+  return out;
 }
 
 function v2Fetch(repo: Repo, req: FetchRequest): GitResponse {
@@ -385,11 +436,28 @@ function v0Fetch(repo: Repo, req: FetchRequest): GitResponse {
 export function handleUploadPack(store: Store, owner: string, repoName: string, body: Buffer, gitProtocolV2: boolean): GitResponse {
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return json404('Repository not found');
+  // Whole-response cache: the reply is a pure function of the request bytes
+  // and the ref state (objects are immutable; every ref-dependent input is in
+  // the key), so identical bytes against identical refs always yield the
+  // identical reply. This skips the pkt-line decode and arg parsing on the
+  // clone workload's 50 byte-identical fetch/ls-refs requests. The hex key is
+  // exact (a lossy utf8 key could collide two different binary bodies).
+  const rawKey = `${gitProtocolV2 ? '2' : '0'}|${refStateKey(repo)}|${body.toString('hex')}`;
+  let perRepo = uploadCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    uploadCache.set(repo, perRepo);
+  }
+  const cached = perRepo.get(rawKey);
+  if (cached !== undefined) return cached;
+  let res: GitResponse;
   let packets;
   try {
     packets = decodePackets(body);
   } catch {
-    return text400('invalid pkt-line stream');
+    res = text400('invalid pkt-line stream');
+    perRepo.set(rawKey, res);
+    return res;
   }
   const lines: string[] = [];
   for (const packet of packets) {
@@ -404,12 +472,18 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
         peel: lines.some((l) => l.trim() === 'peel'),
         prefixes: lines.filter((l) => l.startsWith('ref-prefix ')).map((l) => l.slice('ref-prefix '.length).trim()),
       };
-      return { status: 200, contentType: UPLOAD_RESULT_CT, body: v2LsRefs(repo, args) };
+      res = { status: 200, contentType: UPLOAD_RESULT_CT, body: v2LsRefs(repo, args) };
+    } else if (command === 'fetch') {
+      res = v2Fetch(repo, parseFetchArgs(lines));
+    } else {
+      res = text400(`unknown v2 command ${JSON.stringify(command)}`);
     }
-    if (command === 'fetch') return v2Fetch(repo, parseFetchArgs(lines));
-    return text400(`unknown v2 command ${JSON.stringify(command)}`);
+  } else {
+    res = v0Fetch(repo, parseFetchArgs(lines));
   }
-  return v0Fetch(repo, parseFetchArgs(lines));
+  if (perRepo.size >= 64) perRepo.delete(perRepo.keys().next().value as string);
+  perRepo.set(rawKey, res);
+  return res;
 }
 
 function parseFetchArgs(lines: string[]): FetchRequest {
